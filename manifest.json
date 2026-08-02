@@ -8,7 +8,7 @@
     }
   ],
   "description": "Editor for town_map.txt. Inspect and edit fly points and locations directly in MakerStudio.",
-  "apiVersion": "1.0.0",
+  "apiVersion": "1.1.0",
   "main": "index.js",
   "permissions": [
     "fs.project",

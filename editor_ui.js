@@ -1,13 +1,27 @@
 // editor_ui.js
 import { parseTownMap, serializeTownMap } from './pbs_parser.js';
 
+let _t = s => s;
+export function setI18n(tFn) { _t = tFn; }
+const imageCache = new Map();
+let cachedGameRoot = null;
+
+export function clearTownMapCache() {
+
+  for (const url of imageCache.values()) {
+    URL.revokeObjectURL(url);
+  }
+  imageCache.clear();
+  cachedGameRoot = null;
+}
+
 export function mountTownMapEditor(ctx, host) {
   const GRID_SIZE = 16;
   
   let regions = [];
   let activeRegion = null;
   let selectedPoint = null;
-  let blobUrlCache = null;
+
 
   let zoom = 1;
   let imgWidth = 0;
@@ -18,25 +32,122 @@ export function mountTownMapEditor(ctx, host) {
   let isDraggingPoint = false;
   let isSpaceDown = false;
 
+    const MAX_HISTORY = 50;
+  const undoStack = [];
+  const redoStack = [];
+  let dragSnapshotPushed = false; 
+  
+  function cloneRegions(src) {
+    return src.map(r => ({
+      id: r.id,
+      name: r.name,
+      filename: r.filename,
+      points: r.points.map(p => ({ ...p }))
+    }));
+  }
+
+  function selectionIndices() {
+    if (!activeRegion || !selectedPoint) return null;
+    const rIdx = regions.indexOf(activeRegion);
+    if (rIdx === -1) return null;
+    const pIdx = activeRegion.points.indexOf(selectedPoint);
+    return { rIdx, pIdx };
+  }
+
+  function applySnapshot(snap) {
+    // 1. Guardamos el nombre de la imagen ANTES de aplicar el undo
+    const oldFilename = activeRegion ? activeRegion.filename : null;
+
+    regions = cloneRegions(snap.regions);
+    const sel = snap.sel;
+    if (sel && sel.rIdx >= 0 && sel.rIdx < regions.length) {
+      activeRegion = regions[sel.rIdx];
+      if (sel.pIdx >= 0 && sel.pIdx < activeRegion.points.length) {
+        selectedPoint = activeRegion.points[sel.pIdx];
+      } else {
+        selectedPoint = null;
+      }
+    } else {
+      activeRegion = regions.length > 0 ? regions[Math.min(sel?.rIdx ?? 0, regions.length - 1)] : null;
+      selectedPoint = null;
+    }
+
+    if (typeof host.updateRegionSelect === 'function') host.updateRegionSelect();
+    const selEl = host.querySelector('#tme-region-select');
+    if (selEl) selEl.value = regions.indexOf(activeRegion);
+    renderPoints();
+    renderSidebar();
+    
+    // 2. Comparamos si la imagen DESPUÉS del undo es diferente
+    const newFilename = activeRegion ? activeRegion.filename : null;
+    
+    // 3. Solo recargamos si realmente cambió la región o el background
+    if (activeRegion && oldFilename !== newFilename) {
+      loadRegionImage(activeRegion);
+    }
+    
+    updateUndoRedoButtons();
+  }
+    function pushUndo() {
+    undoStack.push({
+      regions: cloneRegions(regions),
+      sel: selectionIndices()
+    });
+    if (undoStack.length > MAX_HISTORY) undoStack.shift();
+    redoStack.length = 0; // cualquier mutacion nueva invalida el redo
+    updateUndoRedoButtons();
+  }
+
+  function undo() {
+    if (undoStack.length === 0) return;
+    redoStack.push({
+      regions: cloneRegions(regions),
+      sel: selectionIndices()
+    });
+    const snap = undoStack.pop();
+    applySnapshot(snap);
+  }
+
+  function redo() {
+    if (redoStack.length === 0) return;
+    undoStack.push({
+      regions: cloneRegions(regions),
+      sel: selectionIndices()
+    });
+    const snap = redoStack.pop();
+    applySnapshot(snap);
+  }
+
+  function updateUndoRedoButtons() {
+    const bU = host.querySelector('#tme-btn-undo');
+    const bR = host.querySelector('#tme-btn-redo');
+    if (bU) bU.disabled = undoStack.length === 0;
+    if (bR) bR.disabled = redoStack.length === 0;
+  }
+
   host.innerHTML = `
     <div style="display: flex; flex-direction: column; height: 100%; background: var(--bg-primary); color: var(--text-primary); font-family: inherit;">
       
       <div style="padding: 8px; background: var(--bg-tertiary); border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: center; z-index: 100;">
         <select id="tme-region-select" style="background: var(--input-bg); color: var(--text-primary); border: 1px solid var(--border); padding: 4px; border-radius: 4px; min-width: 150px; outline: none;"></select>
-        <button id="tme-btn-save" style="background: var(--accent); color: var(--accent-text); border: none; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-weight: bold;">Save PBS</button>
+        <button id="tme-btn-save" style="background: var(--accent); color: var(--accent-text); border: none; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-weight: bold;">${_t('Save PBS')}</button>
         <div style="margin-left: auto; font-size: 11px; color: var(--text-secondary);">
-          <span id="tme-zoom-level">Zoom: 100%</span>
+          <span id="tme-zoom-level">${_t('Zoom')}: 100%</span>
         </div>
       </div>
 
       <div style="display: flex; flex: 1; overflow: hidden; position: relative;">
         
         <div id="tme-viewport" style="flex: 2; overflow: auto; background: var(--canvas-bg); position: relative; cursor: crosshair;">
-          
+                  <style>@keyframes tme-spin { to { transform: rotate(360deg); } }</style>
+          <div id="tme-loader" style="display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 50; justify-content: center; align-items: center; backdrop-filter: blur(2px);">
+            <div style="width: 40px; height: 40px; border: 4px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: tme-spin 0.8s linear infinite;"></div>
+          </div>
+
           <div id="tme-layout-spacer" style="position: absolute; top: 0; left: 0; pointer-events: none;"></div>
 
           <div id="tme-map-container" style="position: absolute; top: 0; left: 0; user-select: none; transform-origin: 0 0;">
-           <img id="tme-map-img" style="display: block; width: 100%; height: 100%; image-rendering: pixelated;" alt="Town Map" draggable="false" />
+           <img id="tme-map-img" style="display: block; width: 100%; height: 100%; image-rendering: pixelated;" alt="${_t('Town Map')}" draggable="false" />
             
             <div id="tme-points-layer" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; 
               background-image: linear-gradient(to right, rgba(255,255,255,0.15) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.15) 1px, transparent 1px);
@@ -66,9 +177,10 @@ export function mountTownMapEditor(ctx, host) {
   const propertiesPanel = host.querySelector('#tme-properties');
   const tooltip = host.querySelector('#tme-tooltip');
   const imgElement = host.querySelector('#tme-map-img');
+  const loaderElement = host.querySelector('#tme-loader');
 
-  // La carga del PBS es async pero la hacemos internamente para que
-  // mountTownMapEditor sea síncrona y pueda retornar cleanup de inmediato.
+
+
   (async () => {
     try {
       const pbsText = await ctx.fs.readProjectFile("PBS/town_map.txt");
@@ -80,7 +192,7 @@ export function mountTownMapEditor(ctx, host) {
         regions.forEach((r, index) => {
           const option = document.createElement('option');
           option.value = index;
-          option.textContent = `[${r.id}] ${r.name || 'Unnamed'}`;
+          option.textContent = `[${r.id}] ${r.name || _t('Unnamed')}`;
           select.appendChild(option);
         });
         if (activeRegion) select.value = regions.indexOf(activeRegion);
@@ -101,41 +213,105 @@ export function mountTownMapEditor(ctx, host) {
         loadRegionImage(activeRegion);
       }
     } catch (err) {
-      ctx.ui.showToast({ message: "PBS/town_map.txt not found", level: "error" });
+      ctx.ui.showToast({ message: _t("PBS/town_map.txt not found"), level: "error" });
     }
   })();
 
-  imgElement.onload = () => {
+imgElement.onload = () => {
     imgWidth = imgElement.naturalWidth;
     imgHeight = imgElement.naturalHeight;
     updateZoom();
     renderPoints();
+    loaderElement.style.display = 'none';
+    imgElement.style.opacity = '1';
   };
+
+  imgElement.onerror = () => {
+    loaderElement.style.display = 'none';
+    ctx.ui.showToast({ message: _t("Error decoding image data."), level: "error" });
+  }; 
+
+  async function findFileRecursive(dirPath, filename) {
+    let entries;
+    try {
+      entries = await window.__TAURI__.core.invoke("list_directory", { path: dirPath });
+    } catch (e) {
+      return null;
+    }
+    if (!entries || !Array.isArray(entries)) return null;
+    for (const entry of entries) {
+      if (entry.name === filename && entry.path) return entry.path;
+    }
+    for (const entry of entries) {
+      if (entry.path && entry.path !== dirPath) {
+        const found = await findFileRecursive(entry.path, filename);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
 
   async function loadRegionImage(region) {
     if (!region || !region.filename) return;
     const gameRoot = ctx.editor.gameRoot();
     if (!gameRoot) return;
 
-    try {
-      const bytes = await window.__TAURI__.core.invoke("read_binary_file", { 
-        path: `${gameRoot}/Graphics/UI/Town Map/${region.filename}` 
-      });
-      
-      const blob = new Blob([new Uint8Array(bytes)], { type: 'image/png' });
-      if (blobUrlCache) URL.revokeObjectURL(blobUrlCache);
-      blobUrlCache = URL.createObjectURL(blob);
-      
-      imgElement.src = blobUrlCache;
-      renderSidebar();
-    } catch (err) {
-      ctx.ui.showToast({ message: `Error loading image: ${region.filename}`, level: "error" });
+      if (cachedGameRoot !== gameRoot) {
+      clearTownMapCache();
+      cachedGameRoot = gameRoot;
     }
-  }
+      if (imageCache.has(region.filename)) {
+      imgElement.src = imageCache.get(region.filename);
+      renderSidebar();
+      return;
+    }
+    loaderElement.style.display = 'flex';
+    imgElement.style.opacity = '0';
+
+
+
+    const basePath = `${gameRoot}/Graphics/UI/Town Map`;
+    let filePath = null;
+
+    try {
+      const exists = await window.__TAURI__.core.invoke("file_exists", {
+        path: `${basePath}/${region.filename}`
+      });
+      if (exists) {
+        filePath = `${basePath}/${region.filename}`;
+      }
+    } catch (e) {}
+
+    if (!filePath) {
+      filePath = await findFileRecursive(basePath, region.filename);
+    }
+
+    if (!filePath) {
+      loaderElement.style.display = 'none'; 
+      ctx.ui.showToast({ message: `${_t('Image not found')}: ${region.filename}`, level: "error" });
+      return;
+    }
+
+    try {
+      const bytes = await window.__TAURI__.core.invoke("read_binary_file", { path: filePath });
+      const blob = new Blob([new Uint8Array(bytes)], { type: 'image/png' });
+
+      const blobUrl = URL.createObjectURL(blob);
+      imageCache.set(region.filename, blobUrl);
+      imgElement.src = blobUrl;
+      renderSidebar();
+        
+  } catch(err) {
+      loaderElement.style.display = 'none';
+      ctx.ui.showToast({ message: `${_t('Error loading image')}: ${region.filename}`, level: "error" });
+
+}
+}
+    
 
 
   function updateZoom() {
-    host.querySelector('#tme-zoom-level').textContent = `Zoom: ${Math.round(zoom * 100)}%`;
+    host.querySelector('#tme-zoom-level').textContent = `${_t('Zoom')}: ${Math.round(zoom * 100)}%`;
     
 
     layoutSpacer.style.width = `${imgWidth * zoom}px`;
@@ -205,26 +381,26 @@ export function mountTownMapEditor(ctx, host) {
     if (!activeRegion) return;
 
     let html = `
-      <h3 style="margin-top: 0; margin-bottom: 12px; color: var(--text-secondary); font-size: 12px; text-transform: uppercase;">Current Region</h3>
+      <h3 style="margin-top: 0; margin-bottom: 12px; color: var(--text-secondary); font-size: 12px; text-transform: uppercase;">${_t('Current Region')}</h3>
       <div style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border);">
         <div>
-          <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary);">REGION NAME</label>
+          <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary);">${_t('REGION NAME')}</label>
           <input type="text" id="reg-name" value="${activeRegion.name}" style="width: 100%; box-sizing: border-box; background: var(--input-bg); color: var(--text-primary); border: 1px solid var(--border); padding: 6px; border-radius: 4px; margin-top: 4px;" />
         </div>
         <div>
-          <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary);">BACKGROUND IMAGE</label>
+          <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary);">${_t('MAP IMAGE')}</label>
           <div style="display: flex; gap: 4px; margin-top: 4px;">
             <input type="text" disabled value="${activeRegion.filename}" style="flex: 1; min-width: 0; background: var(--bg-tertiary); color: var(--text-tertiary); border: 1px solid var(--border); padding: 6px; border-radius: 4px;" />
-            <button id="reg-pick-graphic" style="background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 4px; padding: 0 8px; cursor: pointer;" title="Change Image">⟲</button>
+            <button id="reg-pick-graphic" style="background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 4px; padding: 0 8px; cursor: pointer;" title="${_t('Change Image')}">⟲</button>
           </div>
         </div>
       </div>
       
-      <h3 style="margin-top: 0; margin-bottom: 12px; color: var(--text-secondary); font-size: 12px; text-transform: uppercase;">Point Properties</h3>
+      <h3 style="margin-top: 0; margin-bottom: 12px; color: var(--text-secondary); font-size: 12px; text-transform: uppercase;">${_t('Point Properties')}</h3>
     `;
 
     if (!selectedPoint) {
-      html += '<p style="color: var(--text-tertiary); font-size: 13px; text-align: center; margin-top: 20px;">Select a point with a <b>click</b>.<br><br><b>Double-click</b> on an empty space to create a new one.<br><br><b>Drag</b> a point to move it.</p>';
+      html += `<p style="color: var(--text-tertiary); font-size: 13px; text-align: center; margin-top: 20px;">${_t('Select a point with a')} <b>${_t('click')}</b>.<br><br><b>${_t('Double-click')}</b> ${_t('on an empty space to create a new one.')}.<br><br><b>${_t('Drag')}</b> ${_t('a point to move it.')}.</p>`;
       propertiesPanel.innerHTML = html;
     } else {
       const hasFly = selectedPoint.healingMap !== "" && selectedPoint.healingMap !== undefined;
@@ -235,7 +411,7 @@ export function mountTownMapEditor(ctx, host) {
         const mapId = parseInt(selectedPoint.healingMap, 10);
         const maps = ctx.projectData.maps(); 
         const mapData = maps.find(m => m.id === mapId);
-        const mapName = mapData ? mapData.name : "Unknown Map";
+        const mapName = mapData ? mapData.name : _t("Unknown Map"); // <-- AQUÍ
         flyDisplayName = `[${mapId}] ${mapName} (${selectedPoint.healingX}, ${selectedPoint.healingY})`;
       }
 
@@ -243,133 +419,63 @@ export function mountTownMapEditor(ctx, host) {
       if (hasSwitch) {
         const swId = parseInt(selectedPoint.switchId, 10);
         const switchNames = ctx.projectData.switchNames();
-        const swName = switchNames[swId] || "Unnamed";
+        const swName = switchNames[swId] || _t("Unnamed");
         switchDisplayName = `[${swId}] ${swName}`;
       }
 
       html += `
         <div style="display: flex; flex-direction: column; gap: 12px;">
           <div>
-            <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary);">COORDINATES (X, Y)</label>
-            <input type="text" id="pt-coords" disabled value="${selectedPoint.x}, ${selectedPoint.y}" style="width: 100%; box-sizing: border-box;
-              background: var(--bg-tertiary); color: var(--text-tertiary); border: 1px solid var(--border); padding: 6px; border-radius: 4px; margin-top: 4px;" 
-            />
+            <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary);">${_t('COORDINATES')} (X, Y)</label>
+            <input type="text" id="pt-coords" disabled value="${selectedPoint.x}, ${selectedPoint.y}" style="width: 100%; box-sizing: border-box; background: var(--bg-tertiary); color: var(--text-tertiary); border: 1px solid var(--border); padding: 6px; border-radius: 4px; margin-top: 4px;" />
           </div>
           <div>
-            <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary);">PLACE NAME</label>
+            <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary);">${_t('PLACE NAME')}</label>
             <input type="text" id="pt-name" value="${selectedPoint.name}" placeholder="" style="width: 100%; box-sizing: border-box; background: var(--input-bg); color: var(--text-primary); border: 1px solid var(--border); padding: 6px; border-radius: 4px; margin-top: 4px;" />
           </div>
           <div>
-            <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary);">POINT OF INTEREST (POI)</label>
+            <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary);">${_t('POINT OF INTEREST')}</label>
             <input type="text" id="pt-poi" value="${selectedPoint.poi}" placeholder="" style="width: 100%; box-sizing: border-box; background: var(--input-bg); color: var(--text-primary); border: 1px solid var(--border); padding: 6px; border-radius: 4px; margin-top: 4px;" />
           </div>
           
           <div>
-            <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary);">FLY DESTINATION</label>
+            <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary);">${_t('FLY DESTINATION')}</label>
             ${hasFly ? `
               <div style="display: flex; gap: 4px; margin-top: 4px;">
                 <button id="pt-pick-coord" style="flex: 1; background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border); padding: 6px; border-radius: 4px; cursor: pointer; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${flyDisplayName}">
                   ${flyDisplayName}
                 </button>
-                 <button id="pt-clear-coord" style="background: var(--danger); color: white; border: none; border-radius: 4px; padding: 0 12px; cursor: pointer;" title="Remove Destination">✖</button>
+                 <button id="pt-clear-coord" style="background: var(--danger); color: white; border: none; border-radius: 4px; padding: 0 12px; cursor: pointer;" title="${_t('Remove Destination')}">✖</button>
               </div>
             ` : `
               <button id="pt-pick-coord" style="width: 100%; margin-top: 4px; background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border); padding: 6px; border-radius: 4px; cursor: pointer; font-weight: bold; transition: background 0.2s;">
-                 Assign fly point
+                 ${_t('Assign fly point')}
               </button>
             `}
           </div>
 
           <div>
-            <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary);">SWITCH</label>
+            <label style="font-size: 11px; font-weight: bold; color: var(--text-secondary);">${_t('SWITCH')}</label>
             ${hasSwitch ? `
               <div style="display: flex; gap: 4px; margin-top: 4px;">
                 <button id="pt-pick-switch" style="flex: 1; background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border); padding: 6px; border-radius: 4px; cursor: pointer; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${switchDisplayName}">
                   ${switchDisplayName}
                 </button>
-                 <button id="pt-clear-switch" style="background: var(--danger); color: white; border: none; border-radius: 4px; padding: 0 12px; cursor: pointer;" title="Remove Switch">✖</button>
+                 <button id="pt-clear-switch" style="background: var(--danger); color: white; border: none; border-radius: 4px; padding: 0 12px; cursor: pointer;" title="${_t('Remove Switch')}">✖</button>
               </div>
             ` : `
               <button id="pt-pick-switch" style="width: 100%; margin-top: 4px; background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border); padding: 6px; border-radius: 4px; cursor: pointer; font-weight: bold; transition: background 0.2s;">
-                 Assign Switch
+                 ${_t('Assign Switch')}
               </button>
             `}
           </div>
 
           <button id="pt-delete" style="margin-top: 16px; background: transparent; color: var(--danger); border: 1px solid var(--danger); padding: 8px; border-radius: 4px; cursor: pointer; font-weight: bold;">
-            Delete Point
+            ${_t('Delete Point')}
           </button>
         </div>
       `;
       propertiesPanel.innerHTML = html;
-    }
-    
-    // --- EVENT LISTENERS SIDEBAR ---
-
-    host.querySelector('#reg-name').addEventListener('input', (e) => {
-      activeRegion.name = e.target.value;
-      host.updateRegionSelect();
-    });
-
-    host.querySelector('#reg-pick-graphic').addEventListener('click', async () => {
-      const img = await ctx.selectors.pickGraphic("UI/Town Map", { title: "Choose Region Background" });
-      if (img) {
-        activeRegion.filename = img.name + ".png";
-        loadRegionImage(activeRegion);
-      }
-    });
-
-    if (selectedPoint) {
-      const bindInput = (id, key) => {
-        const el = host.querySelector(`#${id}`);
-        if (el) el.addEventListener('input', (e) => selectedPoint[key] = e.target.value);
-      };
-      
-      bindInput('pt-name', 'name');
-      bindInput('pt-poi', 'poi');
-      
-      host.querySelector('#pt-pick-coord')?.addEventListener('click', async () => {
-        const mId = parseInt(selectedPoint.healingMap, 10);
-        const mX = parseInt(selectedPoint.healingX, 10);
-        const mY = parseInt(selectedPoint.healingY, 10);
-        const initialOpts = (!isNaN(mId) && !isNaN(mX) && !isNaN(mY)) ? { mapId: mId, x: mX, y: mY } : undefined;
-
-        const coord = await ctx.selectors.pickCoordinate({ initial: initialOpts, title: "Fly Destination" });
-        if (coord) {
-          selectedPoint.healingMap = coord.mapId.toString();
-          selectedPoint.healingX = coord.x.toString();
-          selectedPoint.healingY = coord.y.toString();
-          renderSidebar();
-        }
-      });
-
-      host.querySelector('#pt-clear-coord')?.addEventListener('click', () => {
-        selectedPoint.healingMap = "";
-        selectedPoint.healingX = "";
-        selectedPoint.healingY = "";
-        renderSidebar(); 
-      });
-
-      host.querySelector('#pt-pick-switch')?.addEventListener('click', async () => {
-        const currentId = parseInt(selectedPoint.switchId, 10);
-        const sw = await ctx.selectors.pickSwitch({ value: isNaN(currentId) ? 0 : currentId });
-        if (sw) {
-          selectedPoint.switchId = sw.id.toString();
-          renderSidebar();
-        }
-      });
-
-      host.querySelector('#pt-clear-switch')?.addEventListener('click', () => {
-        selectedPoint.switchId = "";
-        renderSidebar();
-      });
-
-      host.querySelector('#pt-delete').addEventListener('click', () => {
-        activeRegion.points = activeRegion.points.filter(p => p !== selectedPoint);
-        selectedPoint = null;
-        renderPoints();
-        renderSidebar();
-      });
     }
   }
 
@@ -413,6 +519,7 @@ export function mountTownMapEditor(ctx, host) {
       if (existingPoint) {
         selectedPoint = existingPoint;
         isDraggingPoint = true;
+        dragSnapshotPushed = false;
       } else {
         selectedPoint = null;
       }
@@ -436,6 +543,7 @@ export function mountTownMapEditor(ctx, host) {
       const collision = activeRegion.points.find(p => p !== selectedPoint && p.x === grid.x && p.y === grid.y);
       
       if (!collision && (selectedPoint.x !== grid.x || selectedPoint.y !== grid.y)) {
+        if (!dragSnapshotPushed) { pushUndo(); dragSnapshotPushed = true; }
         selectedPoint.x = grid.x;
         selectedPoint.y = grid.y;
         renderPoints();
@@ -456,7 +564,7 @@ export function mountTownMapEditor(ctx, host) {
           tooltip.style.display = 'block';
           tooltip.style.left = (e.clientX - parentRect.left + 15) + 'px';
           tooltip.style.top = (e.clientY - parentRect.top + 15) + 'px';
-          tooltip.innerHTML = `<strong style="color: var(--accent);">${hoverPt.name || 'Unnamed'}</strong>${hoverPt.poi ? `<br/>${hoverPt.poi}` : ''}`;
+          tooltip.innerHTML = `<strong style="color: var(--accent);">${hoverPt.name || _t('Unnamed')}</strong>${hoverPt.poi ? `<br/>${hoverPt.poi}` : ''}`;
         } else {
           tooltip.style.display = 'none';
         }
@@ -493,6 +601,15 @@ export function mountTownMapEditor(ctx, host) {
 
     const key = e.key.toLowerCase();
 
+    if (e.ctrlKey && key === 'z') {
+      e.preventDefault();
+      undo();
+    }
+
+    if (e.ctrlKey && key === 'y') {
+      e.preventDefault();
+      redo();
+    }
     
     if (e.ctrlKey && key === 's') {
       e.preventDefault();
@@ -534,6 +651,7 @@ export function mountTownMapEditor(ctx, host) {
     const existingPoint = activeRegion.points.find(p => p.x === grid.x && p.y === grid.y);
 
     if (!existingPoint) {
+      pushUndo();
       const newPoint = { x: grid.x, y: grid.y, name: "", poi: "", healingMap: "", healingX: "", healingY: "", switchId: "" };
       activeRegion.points.push(newPoint);
       selectedPoint = newPoint;
@@ -548,15 +666,15 @@ export function mountTownMapEditor(ctx, host) {
     try {
       const newPbs = serializeTownMap(regions);
       await ctx.fs.writeProjectFile("PBS/town_map.txt", newPbs);
-      ctx.ui.showToast({ message: "town_map.txt saved successfully.", level: "info" });
+      ctx.ui.showToast({ message: _t("town_map.txt saved successfully."), level: "info" });
     } catch (err) {
       ctx.log.error(err);
-      ctx.ui.showToast({ message: "Error saving town_map.txt", level: "error" });
+      ctx.ui.showToast({ message: _t("Error saving town_map.txt"), level: "error" });
     }
   });
 
   return () => {
-    if (blobUrlCache) URL.revokeObjectURL(blobUrlCache);
+    
     window.removeEventListener('mousemove', onMouseMove);
     window.removeEventListener('mouseup', onMouseUp);
     window.removeEventListener('keydown', onKeyDown, { capture: true });
