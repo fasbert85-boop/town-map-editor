@@ -1,4 +1,3 @@
-// editor_ui.js
 import { parseTownMap, serializeTownMap } from './pbs_parser.js';
 
 let _t = s => s;
@@ -21,6 +20,7 @@ export function mountTownMapEditor(ctx, host) {
   let regions = [];
   let activeRegion = null;
   let selectedPoint = null;
+  let copiedPoint = null;
 
 
   let zoom = 1;
@@ -55,7 +55,6 @@ export function mountTownMapEditor(ctx, host) {
   }
 
   function applySnapshot(snap) {
-    // 1. Guardamos el nombre de la imagen ANTES de aplicar el undo
     const oldFilename = activeRegion ? activeRegion.filename : null;
 
     regions = cloneRegions(snap.regions);
@@ -77,15 +76,12 @@ export function mountTownMapEditor(ctx, host) {
     if (selEl) selEl.value = regions.indexOf(activeRegion);
     renderPoints();
     renderSidebar();
-    
-    // 2. Comparamos si la imagen DESPUÉS del undo es diferente
+
     const newFilename = activeRegion ? activeRegion.filename : null;
-    
-    // 3. Solo recargamos si realmente cambió la región o el background
     if (activeRegion && oldFilename !== newFilename) {
       loadRegionImage(activeRegion);
     }
-    
+
     updateUndoRedoButtons();
   }
     function pushUndo() {
@@ -94,7 +90,7 @@ export function mountTownMapEditor(ctx, host) {
       sel: selectionIndices()
     });
     if (undoStack.length > MAX_HISTORY) undoStack.shift();
-    redoStack.length = 0; // cualquier mutacion nueva invalida el redo
+    redoStack.length = 0;
     updateUndoRedoButtons();
   }
 
@@ -130,6 +126,8 @@ export function mountTownMapEditor(ctx, host) {
       
       <div style="padding: 8px; background: var(--bg-tertiary); border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: center; z-index: 100;">
         <select id="tme-region-select" style="background: var(--input-bg); color: var(--text-primary); border: 1px solid var(--border); padding: 4px; border-radius: 4px; min-width: 150px; outline: none;"></select>
+        <input type="text" id="tme-new-name" placeholder="${_t('New region name')}" style="display: none; width: 130px; padding: 4px 8px; background: var(--input-bg); color: var(--text-primary); border: 1px solid var(--border); border-radius: 4px; font-size: 11px; outline: none;" />
+        <button id="tme-btn-new" style="background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border); padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: bold;">+ ${_t('Add')}</button>
         <button id="tme-btn-save" style="background: var(--accent); color: var(--accent-text); border: none; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-weight: bold;">${_t('Save PBS')}</button>
         <div style="margin-left: auto; font-size: 11px; color: var(--text-secondary);">
           <span id="tme-zoom-level">${_t('Zoom')}: 100%</span>
@@ -395,7 +393,19 @@ imgElement.onload = () => {
           </div>
         </div>
       </div>
-      
+
+      <h3 style="margin: 0 0 8px; color: var(--text-secondary); font-size: 12px; text-transform: uppercase;">${_t('Points')} (${activeRegion.points.length})</h3>
+      <input type="text" id="pt-search" placeholder="${_t('Search points...')}" style="width: 100%; box-sizing: border-box; padding: 5px 8px; background: var(--input-bg); color: var(--text-primary); border: 1px solid var(--border); border-radius: 4px; font-size: 11px; outline: none; margin-bottom: 6px;" />
+      <div id="pt-list" style="max-height: 160px; overflow-y: auto; border: 1px solid var(--border); border-radius: 4px; margin-bottom: 16px;">
+        ${activeRegion.points.length === 0 ? `<p style="color: var(--text-tertiary); font-size: 11px; text-align: center; padding: 8px;">${_t('No points yet')}</p>` :
+          activeRegion.points.map((p, i) => `
+            <div class="tme-pt-item" data-idx="${i}" style="padding: 5px 8px; cursor: pointer; font-size: 11px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; ${p === selectedPoint ? 'background: var(--accent); color: var(--accent-text);' : ''}">
+              <span>${p.name || _t('Unnamed')}</span>
+              <span style="opacity: 0.6;">${p.x},${p.y}</span>
+            </div>
+          `).join('')}
+      </div>
+
       <h3 style="margin-top: 0; margin-bottom: 12px; color: var(--text-secondary); font-size: 12px; text-transform: uppercase;">${_t('Point Properties')}</h3>
     `;
 
@@ -411,7 +421,7 @@ imgElement.onload = () => {
         const mapId = parseInt(selectedPoint.healingMap, 10);
         const maps = ctx.projectData.maps(); 
         const mapData = maps.find(m => m.id === mapId);
-        const mapName = mapData ? mapData.name : _t("Unknown Map"); // <-- AQUÍ
+        const mapName = mapData ? mapData.name : _t("Unknown Map");
         flyDisplayName = `[${mapId}] ${mapName} (${selectedPoint.healingX}, ${selectedPoint.healingY})`;
       }
 
@@ -476,6 +486,116 @@ imgElement.onload = () => {
         </div>
       `;
       propertiesPanel.innerHTML = html;
+    }
+
+    // ── Sidebar event listeners ──
+    host.querySelector('#reg-name')?.addEventListener('input', (e) => {
+      if (activeRegion) activeRegion.name = e.target.value;
+      host.updateRegionSelect?.();
+    });
+
+    host.querySelector('#reg-pick-graphic')?.addEventListener('click', async () => {
+      if (!activeRegion) return;
+      try {
+        const img = await ctx.selectors.pickGraphic("UI/Town Map", { title: _t("Choose Region Background") });
+        if (img) {
+          activeRegion.filename = img.name + ".png";
+          loadRegionImage(activeRegion);
+        }
+      } catch (e) {
+        ctx.ui.showToast({ message: _t("Failed to change image"), level: "error" });
+      }
+    });
+
+    // ── Points list + search ──
+    const searchInput = host.querySelector('#pt-search');
+    const ptList = host.querySelector('#pt-list');
+    const renderPtList = (filter = '') => {
+      if (!ptList || !activeRegion) return;
+      const q = filter.toLowerCase();
+      const filtered = activeRegion.points.map((p, i) => ({ p, i })).filter(({ p }) =>
+        !q || (p.name || '').toLowerCase().includes(q) || `${p.x},${p.y}`.includes(q)
+      );
+      ptList.innerHTML = filtered.length === 0
+        ? `<p style="color: var(--text-tertiary); font-size: 11px; text-align: center; padding: 8px;">${_t('No points')}</p>`
+        : filtered.map(({ p, i }) => `
+            <div class="tme-pt-item" data-idx="${i}" style="padding: 5px 8px; cursor: pointer; font-size: 11px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; ${p === selectedPoint ? 'background: var(--accent); color: var(--accent-text);' : ''}">
+              <span>${p.name || _t('Unnamed')}</span>
+              <span style="opacity: 0.6;">${p.x},${p.y}</span>
+            </div>`).join('');
+      ptList.querySelectorAll('.tme-pt-item').forEach(el => {
+        el.addEventListener('click', () => {
+          const idx = parseInt(el.dataset.idx, 10);
+          selectedPoint = activeRegion.points[idx];
+          renderPoints();
+          renderSidebar();
+        });
+      });
+    };
+    searchInput?.addEventListener('input', (e) => renderPtList(e.target.value));
+    renderPtList();
+
+    if (selectedPoint) {
+      const bindInput = (id, key) => {
+        const el = host.querySelector(`#${id}`);
+        if (el) el.addEventListener('input', (e) => { selectedPoint[key] = e.target.value; });
+      };
+      bindInput('pt-name', 'name');
+      bindInput('pt-poi', 'poi');
+
+      host.querySelector('#pt-pick-coord')?.addEventListener('click', async () => {
+        try {
+          const mId = parseInt(selectedPoint.healingMap, 10);
+          const mX = parseInt(selectedPoint.healingX, 10);
+          const mY = parseInt(selectedPoint.healingY, 10);
+          const initialOpts = (!isNaN(mId) && !isNaN(mX) && !isNaN(mY)) ? { mapId: mId, x: mX, y: mY } : undefined;
+
+          const coord = await ctx.selectors.pickCoordinate({ initial: initialOpts, title: _t("Fly Destination") });
+          if (coord) {
+            selectedPoint.healingMap = coord.mapId.toString();
+            selectedPoint.healingX = coord.x.toString();
+            selectedPoint.healingY = coord.y.toString();
+            renderSidebar();
+          }
+        } catch (e) {
+          ctx.ui.showToast({ message: _t("Failed to assign fly point"), level: "error" });
+        }
+      });
+
+      host.querySelector('#pt-clear-coord')?.addEventListener('click', () => {
+        selectedPoint.healingMap = "";
+        selectedPoint.healingX = "";
+        selectedPoint.healingY = "";
+        renderSidebar();
+      });
+
+      host.querySelector('#pt-pick-switch')?.addEventListener('click', async () => {
+        try {
+          const currentId = parseInt(selectedPoint.switchId, 10);
+          const sw = await ctx.selectors.pickSwitch({ value: isNaN(currentId) ? 0 : currentId });
+          if (sw) {
+            selectedPoint.switchId = sw.id.toString();
+            renderSidebar();
+          }
+        } catch (e) {
+          ctx.ui.showToast({ message: _t("Failed to assign switch"), level: "error" });
+        }
+      });
+
+      host.querySelector('#pt-clear-switch')?.addEventListener('click', () => {
+        selectedPoint.switchId = "";
+        renderSidebar();
+      });
+
+      host.querySelector('#pt-delete')?.addEventListener('click', () => {
+        if (!activeRegion || !selectedPoint) return;
+        pushUndo();
+        const idx = activeRegion.points.indexOf(selectedPoint);
+        if (idx !== -1) activeRegion.points.splice(idx, 1);
+        selectedPoint = null;
+        renderPoints();
+        renderSidebar();
+      });
     }
   }
 
@@ -552,7 +672,6 @@ imgElement.onload = () => {
       }
     }
 
-    // Tooltips
     if (!isDraggingPoint && !isPanning && activeRegion) {
       const rect = viewport.getBoundingClientRect();
       if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
@@ -620,6 +739,22 @@ imgElement.onload = () => {
       if (saveBtn) saveBtn.click();
     }
 
+    if (e.ctrlKey && key === 'c' && selectedPoint && document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'TEXTAREA') {
+      copiedPoint = { ...selectedPoint };
+      ctx.ui.showToast({ message: _t("Point copied"), level: "info" });
+    }
+
+    if (e.ctrlKey && key === 'v' && copiedPoint && activeRegion && document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'TEXTAREA') {
+      e.preventDefault();
+      pushUndo();
+      const newPoint = { ...copiedPoint, x: copiedPoint.x + 1, y: copiedPoint.y + 1 };
+      activeRegion.points.push(newPoint);
+      selectedPoint = newPoint;
+      renderPoints();
+      renderSidebar();
+      ctx.ui.showToast({ message: _t("Point pasted"), level: "info" });
+    }
+
     if (e.key === 'Delete' && selectedPoint) {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
       const deleteBtn = host.querySelector('#pt-delete');
@@ -671,6 +806,40 @@ imgElement.onload = () => {
       ctx.log.error(err);
       ctx.ui.showToast({ message: _t("Error saving town_map.txt"), level: "error" });
     }
+  });
+
+  // ── New Map ──
+  const newNameInput = host.querySelector('#tme-new-name');
+  const newBtn = host.querySelector('#tme-btn-new');
+  const createNewRegion = () => {
+    const val = newNameInput?.value?.trim();
+    if (!val) return;
+
+    const maxId = regions.reduce((max, r) => Math.max(max, r.id || 0), 0);
+    pushUndo();
+    const newRegion = { id: maxId + 1, name: val, filename: "", points: [] };
+    regions.push(newRegion);
+    activeRegion = newRegion;
+    selectedPoint = null;
+
+    host.updateRegionSelect?.();
+    const select = host.querySelector('#tme-region-select');
+    if (select) select.value = regions.indexOf(newRegion);
+
+    loadRegionImage(newRegion);
+    renderPoints();
+    renderSidebar();
+    newNameInput.value = '';
+    newNameInput.style.display = 'none';
+    ctx.ui.showToast({ message: _t("Region added"), level: "info" });
+  };
+  newBtn?.addEventListener('click', () => {
+    newNameInput.style.display = newNameInput.style.display === 'none' ? 'block' : 'none';
+    if (newNameInput.style.display !== 'none') newNameInput.focus();
+  });
+  newNameInput?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); createNewRegion(); }
+    if (e.key === 'Escape') { newNameInput.style.display = 'none'; newNameInput.value = ''; }
   });
 
   return () => {
