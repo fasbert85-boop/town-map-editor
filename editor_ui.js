@@ -526,9 +526,12 @@ imgElement.onload = () => {
       ptList.querySelectorAll('.tme-pt-item').forEach(el => {
         el.addEventListener('click', () => {
           const idx = parseInt(el.dataset.idx, 10);
+          const scrollPos = ptList.scrollTop;
           selectedPoint = activeRegion.points[idx];
           renderPoints();
           renderSidebar();
+          const newList = host.querySelector('#pt-list');
+          if (newList) newList.scrollTop = scrollPos;
         });
       });
     };
